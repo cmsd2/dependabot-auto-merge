@@ -1,0 +1,127 @@
+name: Dependabot auto-merge
+
+# Reusable workflow. Arms GitHub auto-merge for low-risk Dependabot PRs; GitHub
+# then merges once the repo's required checks pass. Call it from a workflow
+# triggered by `pull_request` (see README.md).
+#
+# A PR is armed only if ALL of these hold:
+#   - it was opened by dependabot[bot], and dependabot[bot] triggered this run
+#   - every dependency it updates is a minor or patch version bump
+#   - it changes only files matching `allowed-files` (globs allowed)
+#   - `required-check` is a required status check on the base branch, via
+#     classic branch protection or a ruleset
+# With `approve: true` it also approves the PR after all of the above hold, for
+# branches that require a review. Anything else is left for a human, with a
+# notice in the run log.
+
+on:
+  workflow_call:
+    inputs:
+      required-check:
+        description: Status check that must be required on the base branch before auto-merge is armed.
+        type: string
+        required: true
+      allowed-files:
+        description: Space-separated globs for the only files an auto-merged PR may change, e.g. "**/pom.xml". * matches /; a leading **/ also matches the repo root.
+        type: string
+        default: "uv.lock pyproject.toml"
+      merge-method:
+        description: squash, merge or rebase.
+        type: string
+        default: squash
+      approve:
+        description: Also approve the PR once every gate has passed, for repos whose branch protection requires a review. Needs "Allow GitHub Actions to create and approve pull requests" enabled.
+        type: boolean
+        default: false
+      runner:
+        description: Runner label to run on (for a self-hosted runner group, replace runs-on below with a group mapping).
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    # github.actor alone is not enough: a human re-run or a push by someone
+    # else changes the actor, and the PR author is what fetch-metadata trusts.
+    if: github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Arm auto-merge if low risk
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          DEPS: ${{ steps.metadata.outputs.updated-dependencies-json }}
+          REQUIRED_CHECK: ${{ inputs.required-check }}
+          ALLOWED_FILES: ${{ inputs.allowed-files }}
+          MERGE_METHOD: ${{ inputs.merge-method }}
+          APPROVE: ${{ inputs.approve }}
+        run: |
+          set -euo pipefail
+
+          skip() { echo "::notice::Not auto-merging: $1"; exit 0; }
+
+          # Checked first because it becomes a gh flag below; --admin would
+          # bypass branch protection and merge at once.
+          case "$MERGE_METHOD" in
+            squash|merge|rebase) ;;
+            *) echo "::error::merge-method must be squash, merge or rebase, not '$MERGE_METHOD'"; exit 1 ;;
+          esac
+
+          jq -e 'length > 0 and all(.[]; .updateType == "version-update:semver-minor" or .updateType == "version-update:semver-patch")' \
+            <<<"$DEPS" >/dev/null \
+            || skip "not every update is a minor/patch bump ($(jq -c '[.[].updateType]' <<<"$DEPS"))"
+
+          # A changed file is allowed if it matches any pattern in ALLOWED_FILES.
+          # Patterns are bash globs where * also matches /; a leading **/ also
+          # matches the repo root, so **/pom.xml allows pom.xml and a/b/pom.xml.
+          set -f  # no filename expansion: the patterns must reach [[ == ]] intact
+          # shellcheck disable=SC2053 # the unquoted right-hand side is the glob
+          allowed() {
+            local f=$1 p
+            for p in $ALLOWED_FILES; do
+              [[ $f == $p ]] && return 0
+              [[ $p == '**/'* && $f == ${p#'**/'} ]] && return 0
+            done
+            return 1
+          }
+          # Read the list into a variable first. A failure inside `< <(...)`
+          # is ignored even with set -e, which would pass an unchecked PR.
+          files=$(gh pr diff "$PR_URL" --name-only) \
+            || skip "could not list the PR's changed files"
+          other=""
+          while IFS= read -r f; do
+            [ -z "$f" ] || allowed "$f" || other+="$f "
+          done <<<"$files"
+          [ -z "$other" ] || skip "changes files outside the allowed list: $other"
+
+          # Fail closed: auto-merge on a branch with no required checks merges
+          # immediately. The check may be required by classic branch protection
+          # or by a ruleset; they are reported by different APIs, so ask both.
+          classic=$(gh api "repos/$REPO/branches/$BASE" 2>/dev/null \
+            | jq --arg c "$REQUIRED_CHECK" '(.protection.required_status_checks.contexts // []) | index($c) != null' \
+            2>/dev/null || echo false)
+          ruleset=$(gh api "repos/$REPO/rules/branches/$BASE" 2>/dev/null \
+            | jq --arg c "$REQUIRED_CHECK" '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context] | index($c) != null' \
+            2>/dev/null || echo false)
+          [ "$classic" = "true" ] || [ "$ruleset" = "true" ] \
+            || skip "'$REQUIRED_CHECK' is not a required status check on $BASE (classic protection or ruleset)"
+
+          gh pr merge --auto "--$MERGE_METHOD" "$PR_URL"
+
+          # Opt-in bot approval, only reached once every gate above has passed.
+          # If this fails the PR is still armed and simply waits for a human.
+          if [ "$APPROVE" = "true" ]; then
+            gh pr review --approve "$PR_URL" \
+              --body "Approved automatically: every update is a minor/patch bump, only allowed files changed, and the required check is enforced on the base branch."
+          fi
