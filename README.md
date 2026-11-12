@@ -51,11 +51,11 @@ moved.
 
 ### Access from other repos
 
-This repo is private. GitHub only lets other repos call its workflow when
-Settings > Actions > General > Access is set to *Accessible from repositories
-owned by the user 'cmsd2'*. Even then, only private repos owned by `cmsd2` can
-call it. A public repo cannot use a workflow from a private one, so to use it
-there, make this repo public or copy the workflow file.
+This repo is public, so any repo, public or private, can call its workflow with
+no access setting here. If the calling repo limits which actions and reusable
+workflows it allows (Settings > Actions > General > Actions permissions), add
+`cmsd2/dependabot-auto-merge/.github/workflows/dependabot-auto-merge.yml@*` to
+its allow list.
 
 ## Before you add it to a repo (in this order)
 
